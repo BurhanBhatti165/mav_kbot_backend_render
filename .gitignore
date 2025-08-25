@@ -1,0 +1,59 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.python-version
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Byte-compiled / optimized / DLL files
+*.log
+pip-wheel-metadata/
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+.mypy_cache/
+.pyre/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS / Editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Env / secrets
+.env
+*.env
+.env.*
+*.pem
+*.key
+
+# Docker
+docker-data/
+*.bak
+
+# Node (if any frontend coexists in repo)
+node_modules/
+npm-debug.log*
+yarn-error.log*
+pnpm-lock.yaml

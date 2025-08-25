@@ -1,0 +1,411 @@
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from starlette.requests import Request
+import pandas as pd
+from typing import Optional, List, Dict
+import uvicorn
+import time
+import asyncio
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+import httpx  # async HTTP client
+
+# -------------------- Config / Globals --------------------
+
+# simple in-memory cache for /exchangeInfo
+_EXINFO_CACHE = {"data": None, "ts": 0}
+_EXINFO_TTL = 300  # seconds
+
+ALLOWED_INTERVALS = {
+    "1m","3m","5m","15m","30m",
+    "1h","2h","4h","6h","8h","12h",
+    "1d","3d","1w","1M"
+}
+
+# polling cadence per interval (seconds) for WebSocket loop
+POLL_SECONDS = {
+    "1m": 2,
+    "3m": 3,
+    "5m": 5,
+    "15m": 10,
+    "30m": 15,
+    "1h": 20,
+    "2h": 30,
+    "4h": 60,
+    "6h": 90,
+    "8h": 120,
+    "12h": 180,
+    "1d": 300,
+    "3d": 600,
+    "1w": 900,
+    "1M": 1800,
+}
+
+# FastAPI app instance
+app = FastAPI(title="Crypto Chart API", description="Real-time cryptocurrency charting application")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+# -------------------- Models --------------------
+
+class CandleOut(BaseModel):
+    time: int = Field(..., description="Epoch milliseconds (UTC)")
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+# -------------------- Service --------------------
+
+class CryptoDataService:
+    def __init__(self, symbol: str = "BTCUSDT"):
+        self.symbol = symbol.upper()
+
+    async def validate_symbol(self) -> tuple[bool, dict]:
+        """Validate if symbol exists on Binance (returns 24hr ticker json if OK)."""
+        url = "https://api3.binance.com/api/v3/ticker/24hr"
+        params = {"symbol": self.symbol}
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(url, params=params)
+                if resp.status_code == 200:
+                    return True, resp.json()
+                return False, {}
+        except httpx.RequestError:
+            return False, {}
+
+    async def fetch_binance_data(self, interval: str = "15m", limit: int = 100) -> Optional[List]:
+        """Fetch kline data from Binance API."""
+        url = "https://api3.binance.com/api/v3/uiKlines"
+        params = {"symbol": self.symbol, "interval": interval, "limit": limit}
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(url, params=params)
+                resp.raise_for_status()
+                return resp.json()
+        except httpx.RequestError as e:
+            print(f"Error fetching data for {self.symbol} {interval}: {e}")
+            return None
+
+    def process_data(self, raw_data: List) -> Optional[pd.DataFrame]:
+        """Convert raw Binance data to pandas DataFrame (UTC-aware timestamps)."""
+        if not raw_data:
+            return None
+
+        columns = [
+            'open_time', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'quote_volume', 'count', 'taker_buy_volume',
+            'taker_buy_quote_volume', 'ignore'
+        ]
+        df = pd.DataFrame(raw_data, columns=columns)
+
+        # Binance timestamps are UTC; keep timezone-aware
+        df['open_time']  = pd.to_datetime(df['open_time'],  unit='ms', utc=True)
+        df['close_time'] = pd.to_datetime(df['close_time'], unit='ms', utc=True)
+
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = df[col].astype(float)
+
+        return df
+
+    @staticmethod
+    def _to_epoch_ms(ts: pd.Timestamp) -> int:
+        """pandas Timestamp (ns) -> epoch milliseconds (int)."""
+        return int(ts.value // 10**6)
+
+    def create_rows_array(self, df: pd.DataFrame) -> List[Dict]:
+        """Return ONLY an array of dictionaries (candles), with time in epoch ms."""
+        if df is None or df.empty:
+            return []
+        return [{
+            "time": self._to_epoch_ms(row["open_time"]),
+            "open": float(row["open"]),
+            "high": float(row["high"]),
+            "low":  float(row["low"]),
+            "close":float(row["close"]),
+            "volume":float(row["volume"])
+        } for _, row in df.iterrows()]
+
+# -------------------- REST: API ROUTES --------------------
+
+@app.get("/api/data", response_model=List[CandleOut])
+async def get_chart_data(
+    symbol: str = Query("BTCUSDT", description="Trading pair symbol"),
+    interval: str = Query("15m", description="Chart timeframe"),
+    limit: int = Query(150, ge=100, le=1000, description="Number of candles (100–1000)")
+):
+    """
+    Returns ONLY an array of candle dictionaries with epoch-ms timestamps.
+    Example: { "time": 1755775800000, "open": ..., "high": ..., "low": ..., "close": ..., "volume": ... }
+    """
+    # interval validation
+    if interval not in ALLOWED_INTERVALS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid interval: {interval}. Allowed: {sorted(ALLOWED_INTERVALS)}"
+        )
+
+    svc = CryptoDataService(symbol.upper())
+
+    # Validate symbol first
+    ok, _ = await svc.validate_symbol()
+    if not ok:
+        raise HTTPException(
+            status_code=400,
+            detail=f'Invalid symbol: {symbol}. Please check if the symbol exists on Binance.'
+        )
+
+    raw = await svc.fetch_binance_data(interval, limit)
+    df = svc.process_data(raw) if raw else None
+    if df is None or df.empty:
+        raise HTTPException(status_code=500, detail=f'Failed to fetch data for {symbol}')
+
+    candles = svc.create_rows_array(df)
+    return candles
+
+@app.get("/")
+async def root():
+    """Main endpoint"""
+    return {
+        "message": "Crypto Chart API",
+        "endpoints": {
+            "chart_data": "/api/data?symbol=BTCUSDT&interval=15m&limit=150",
+            "search": "/api/search?q=BTC",
+            "popular": "/api/popular",
+            "timeframes": "/api/timeframes",
+            "ws_data": "/ws/data?symbol=BTCUSDT&interval=15m&limit=150"
+        }
+    }
+
+@app.get("/api/search")
+async def search_symbols(
+    q: Optional[str] = Query(None, description="Search query for symbols (optional)"),
+):
+    """
+    Search only USDT pairs.
+    - If q is empty -> return ALL TRADING USDT pairs
+    - If q is a coin name (e.g. 'BTC') -> auto-append 'USDT'
+    """
+    global _EXINFO_CACHE, _EXINFO_TTL
+
+    now = time.time()
+    if not _EXINFO_CACHE["data"] or (now - _EXINFO_CACHE["ts"] > _EXINFO_TTL):
+        try:
+            url = "https://api3.binance.com/api/v3/exchangeInfo"
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                _EXINFO_CACHE["data"] = resp.json()
+                _EXINFO_CACHE["ts"] = now
+        except httpx.RequestError:
+            raise HTTPException(status_code=500, detail="Failed to fetch symbols from Binance")
+
+    data = _EXINFO_CACHE["data"]
+
+    # full TRADING list with only USDT quote
+    all_trading = []
+    for s in data.get("symbols", []):
+        if s.get("status") == "TRADING" and s.get("quoteAsset") == "USDT":
+            all_trading.append(s.get("symbol"))  # e.g. BTCUSDT
+
+    if not q or not q.strip():
+        return {"symbols": all_trading}
+
+    query = q.strip().upper()
+    if not query.endswith("USDT"):
+        query = query + "USDT"
+
+    if query in all_trading:
+        return {"symbols": [query]}
+
+    base = query.replace("USDT", "")
+    hits = [sym for sym in all_trading if base in sym]
+    if hits:
+        return {"symbols": hits[:10]}
+
+    return {"message": f"{query} not available against USDT"}
+
+@app.get("/api/popular")
+async def get_popular_symbols():
+    """
+    Return exactly top 10 USDT pairs from last 24h by quote volume.
+    Response JSON: [{"symbol": "BTC", "price": 67000.5}, ...]
+    """
+    url = "https://api3.binance.com/api/v3/ticker/24hr"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            tickers = r.json()
+    except httpx.RequestError:
+        raise HTTPException(status_code=500, detail="Failed to fetch 24h tickers")
+
+    rows = []
+    for t in tickers:
+        sym = t.get("symbol", "")
+        if not sym.endswith("USDT"):  # only USDT pairs
+            continue
+        try:
+            rows.append({
+                "symbol": sym.replace("USDT", ""),  # base only
+                "price": float(t.get("lastPrice", 0) or 0),
+                "quoteVolume": float(t.get("quoteVolume", 0) or 0),
+            })
+        except (TypeError, ValueError):
+            continue
+
+    rows.sort(key=lambda x: x["quoteVolume"], reverse=True)
+    top10 = [{"symbol": r["symbol"], "price": r["price"]} for r in rows[:10]]
+    return top10
+
+@app.get("/api/timeframes")
+async def get_timeframes():
+    """Return timeframes as a simple JSON list (interval + label)."""
+    return [
+        {"interval": "1m",  "label": "1 Minute"},
+        {"interval": "3m",  "label": "3 Minutes"},
+        {"interval": "5m",  "label": "5 Minutes"},
+        {"interval": "15m", "label": "15 Minutes"},
+        {"interval": "30m", "label": "30 Minutes"},
+        {"interval": "1h",  "label": "1 Hour"},
+        {"interval": "2h",  "label": "2 Hours"},
+        {"interval": "4h",  "label": "4 Hours"},
+        {"interval": "6h",  "label": "6 Hours"},
+        {"interval": "8h",  "label": "8 Hours"},
+        {"interval": "12h", "label": "12 Hours"},
+        {"interval": "1d",  "label": "1 Day"},
+        {"interval": "3d",  "label": "3 Days"},
+        {"interval": "1w",  "label": "1 Week"},
+        {"interval": "1M",  "label": "1 Month"},
+    ]
+
+# -------------------- WEBSOCKET: /ws/data --------------------
+
+def _safe_int(value: Optional[str], default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+@app.websocket("/ws/data")
+async def ws_data(websocket: WebSocket):
+    """
+    WebSocket for streaming candle data.
+    Query params:
+      - symbol (default BTCUSDT)
+      - interval (default 15m)
+      - limit (default 150; 100–1000)
+    Messages:
+      - snapshot: {"type":"snapshot","symbol":...,"interval":...,"limit":...,"candles":[{...},...]}
+      - update:   {"type":"update","symbol":...,"interval":...,"candle":{...},"is_new_bar":true|false}
+      - error:    {"type":"error","detail":"..."}
+    """
+    await websocket.accept()
+
+    # parse query params
+    qp = websocket.query_params
+    symbol = (qp.get("symbol") or "BTCUSDT").upper()
+    interval = qp.get("interval") or "15m"
+    limit = _safe_int(qp.get("limit"), 150)
+
+    # validate basic params
+    if interval not in ALLOWED_INTERVALS:
+        await websocket.send_json({"type": "error", "detail": f"Invalid interval: {interval}. Allowed: {sorted(ALLOWED_INTERVALS)}"})
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    if limit < 100 or limit > 1000:
+        await websocket.send_json({"type": "error", "detail": "Limit must be between 100 and 1000"})
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    svc = CryptoDataService(symbol)
+
+    # validate symbol via Binance
+    ok, _ = await svc.validate_symbol()
+    if not ok:
+        await websocket.send_json({"type": "error", "detail": f"Invalid symbol: {symbol}. Please check if the symbol exists on Binance."})
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    poll = POLL_SECONDS.get(interval, 10)
+
+    # initial snapshot
+    raw = await svc.fetch_binance_data(interval, limit)
+    df = svc.process_data(raw) if raw else None
+    if df is None or df.empty:
+        await websocket.send_json({"type": "error", "detail": f"Failed to fetch data for {symbol}"})
+        await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+        return
+
+    candles = svc.create_rows_array(df)
+    await websocket.send_json({
+        "type": "snapshot",
+        "symbol": symbol,
+        "interval": interval,
+        "limit": limit,
+        "candles": candles
+    })
+
+    # track last bar open_time (epoch ms) to know when a new bar appears
+    last_bar_time_ms = candles[-1]["time"] if candles else None
+
+    try:
+        while True:
+            await asyncio.sleep(poll)
+
+            # fetch latest set (limit small to reduce payload; include last + prev)
+            raw2 = await svc.fetch_binance_data(interval, max(2, min(limit, 200)))
+            df2 = svc.process_data(raw2) if raw2 else None
+            if df2 is None or df2.empty:
+                # transient error -> skip this tick
+                continue
+
+            latest_arr = svc.create_rows_array(df2)
+            latest_candle = latest_arr[-1]
+            latest_time_ms = latest_candle["time"]
+
+            is_new_bar = (last_bar_time_ms is not None and latest_time_ms > last_bar_time_ms)
+
+            # send update (always send, FE can decide how to merge)
+            await websocket.send_json({
+                "type": "update",
+                "symbol": symbol,
+                "interval": interval,
+                "candle": latest_candle,
+                "is_new_bar": bool(is_new_bar)
+            })
+
+            # update tracker if new bar started
+            if is_new_bar:
+                last_bar_time_ms = latest_time_ms
+
+    except WebSocketDisconnect:
+        # client disconnected; just exit
+        return
+    except Exception as e:
+        # unexpected error; try to notify client and close
+        try:
+            await websocket.send_json({"type": "error", "detail": f"Server error: {str(e)}"})
+        finally:
+            await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+
+# -------------------- ENTRYPOINT --------------------
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host="127.0.0.1",
+        port=8000,
+        reload=True,
+        log_level="info"
+    )
