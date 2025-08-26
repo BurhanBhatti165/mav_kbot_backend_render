@@ -12,9 +12,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import httpx  # async HTTP client
 
+# indicators
+from indicators import (
+    ALLOWED_RSI_PERIODS,
+    parse_periods,
+    rsi_series_values,
+    latest_rsi_values,
+    attach_rsi_to_candles,
+)
+
 # -------------------- Config / Globals --------------------
 
-# simple in-memory cache for /exchangeInfo
+# in-memory cache for /exchangeInfo
 _EXINFO_CACHE = {"data": None, "ts": 0}
 _EXINFO_TTL = 300  # seconds
 
@@ -26,21 +35,9 @@ ALLOWED_INTERVALS = {
 
 # polling cadence per interval (seconds) for WebSocket loop
 POLL_SECONDS = {
-    "1m": 2,
-    "3m": 3,
-    "5m": 5,
-    "15m": 10,
-    "30m": 15,
-    "1h": 20,
-    "2h": 30,
-    "4h": 60,
-    "6h": 90,
-    "8h": 120,
-    "12h": 180,
-    "1d": 300,
-    "3d": 600,
-    "1w": 900,
-    "1M": 1800,
+    "1m": 2, "3m": 3, "5m": 5, "15m": 10, "30m": 15,
+    "1h": 20, "2h": 30, "4h": 60, "6h": 90, "8h": 120,
+    "12h": 180, "1d": 300, "3d": 600, "1w": 900, "1M": 1800,
 }
 
 # FastAPI app instance
@@ -63,6 +60,8 @@ class CandleOut(BaseModel):
     low: float
     close: float
     volume: float
+    # optional RSI attachment per candle (only present if include_rsi=true)
+    rsi: Optional[Dict[str, Optional[float]]] = None
 
 # -------------------- Service --------------------
 
@@ -141,35 +140,35 @@ class CryptoDataService:
 async def get_chart_data(
     symbol: str = Query("BTCUSDT", description="Trading pair symbol"),
     interval: str = Query("15m", description="Chart timeframe"),
-    limit: int = Query(150, ge=100, le=1000, description="Number of candles (100–1000)")
+    limit: int = Query(150, ge=100, le=1000, description="Number of candles (100–1000)"),
+    include_rsi: bool = Query(False, description="Attach RSI values per candle"),
+    rsi_periods: str = Query("12", description="CSV of RSI periods; allowed: 6,8,12,14,24 (default 12)")
 ):
     """
-    Returns ONLY an array of candle dictionaries with epoch-ms timestamps.
-    Example: { "time": 1755775800000, "open": ..., "high": ..., "low": ..., "close": ..., "volume": ... }
+    Returns an array of candle dictionaries with epoch-ms timestamps.
+    If include_rsi=true, each candle includes: "rsi": {"12": <val>, "...": ...}
     """
-    # interval validation
     if interval not in ALLOWED_INTERVALS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid interval: {interval}. Allowed: {sorted(ALLOWED_INTERVALS)}"
-        )
+        raise HTTPException(400, f"Invalid interval: {interval}. Allowed: {sorted(ALLOWED_INTERVALS)}")
+
+    periods = parse_periods(rsi_periods, default=[12])
 
     svc = CryptoDataService(symbol.upper())
-
-    # Validate symbol first
     ok, _ = await svc.validate_symbol()
     if not ok:
-        raise HTTPException(
-            status_code=400,
-            detail=f'Invalid symbol: {symbol}. Please check if the symbol exists on Binance.'
-        )
+        raise HTTPException(400, f'Invalid symbol: {symbol}. Please check if the symbol exists on Binance.')
 
     raw = await svc.fetch_binance_data(interval, limit)
     df = svc.process_data(raw) if raw else None
     if df is None or df.empty:
-        raise HTTPException(status_code=500, detail=f'Failed to fetch data for {symbol}')
+        raise HTTPException(500, f'Failed to fetch data for {symbol}')
 
-    candles = svc.create_rows_array(df)
+    if include_rsi:
+        # keep array-of-dicts shape, but add rsi per candle
+        candles = attach_rsi_to_candles(df, periods)
+    else:
+        candles = svc.create_rows_array(df)
+
     return candles
 
 @app.get("/")
@@ -179,10 +178,11 @@ async def root():
         "message": "Crypto Chart API",
         "endpoints": {
             "chart_data": "/api/data?symbol=BTCUSDT&interval=15m&limit=150",
+            "chart_data_with_rsi": "/api/data?symbol=BTCUSDT&interval=15m&limit=150&include_rsi=true&rsi_periods=12",
             "search": "/api/search?q=BTC",
             "popular": "/api/popular",
             "timeframes": "/api/timeframes",
-            "ws_data": "/ws/data?symbol=BTCUSDT&interval=15m&limit=150"
+            "ws_data": "/ws/data?symbol=BTCUSDT&interval=15m&limit=150&include_rsi=false&rsi_periods=12"
         }
     }
 
@@ -299,15 +299,16 @@ def _safe_int(value: Optional[str], default: int) -> int:
 @app.websocket("/ws/data")
 async def ws_data(websocket: WebSocket):
     """
-    WebSocket for streaming candle data.
+    WebSocket for streaming candles, with optional RSI attached.
     Query params:
       - symbol (default BTCUSDT)
       - interval (default 15m)
       - limit (default 150; 100–1000)
-    Messages:
-      - snapshot: {"type":"snapshot","symbol":...,"interval":...,"limit":...,"candles":[{...},...]}
-      - update:   {"type":"update","symbol":...,"interval":...,"candle":{...},"is_new_bar":true|false}
-      - error:    {"type":"error","detail":"..."}
+      - include_rsi (default false)
+      - rsi_periods (CSV, default "12", allowed 6,8,12,14,24)
+
+    Control message (optional, JSON):
+      - {"type":"set_rsi","include":true|false,"periods":[6,12,24]}
     """
     await websocket.accept()
 
@@ -316,6 +317,8 @@ async def ws_data(websocket: WebSocket):
     symbol = (qp.get("symbol") or "BTCUSDT").upper()
     interval = qp.get("interval") or "15m"
     limit = _safe_int(qp.get("limit"), 150)
+    include_rsi = (str(qp.get("include_rsi", "false")).lower() == "true")
+    rsi_periods = parse_periods(qp.get("rsi_periods"), default=[12])
 
     # validate basic params
     if interval not in ALLOWED_INTERVALS:
@@ -330,7 +333,7 @@ async def ws_data(websocket: WebSocket):
 
     svc = CryptoDataService(symbol)
 
-    # validate symbol via Binance
+    # validate symbol
     ok, _ = await svc.validate_symbol()
     if not ok:
         await websocket.send_json({"type": "error", "detail": f"Invalid symbol: {symbol}. Please check if the symbol exists on Binance."})
@@ -347,7 +350,12 @@ async def ws_data(websocket: WebSocket):
         await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
         return
 
-    candles = svc.create_rows_array(df)
+    # build candles (with or without RSI)
+    if include_rsi:
+        candles = attach_rsi_to_candles(df, rsi_periods)
+    else:
+        candles = svc.create_rows_array(df)
+
     await websocket.send_json({
         "type": "snapshot",
         "symbol": symbol,
@@ -356,27 +364,58 @@ async def ws_data(websocket: WebSocket):
         "candles": candles
     })
 
-    # track last bar open_time (epoch ms) to know when a new bar appears
     last_bar_time_ms = candles[-1]["time"] if candles else None
+
+    async def maybe_receive_control():
+        nonlocal include_rsi, rsi_periods
+        try:
+            # non-blocking-ish: short timeout to check for control messages
+            msg = await asyncio.wait_for(websocket.receive_json(), timeout=0.01)
+        except asyncio.TimeoutError:
+            return
+        except Exception:
+            return
+
+        if isinstance(msg, dict) and msg.get("type") == "set_rsi":
+            new_include = msg.get("include", include_rsi)
+            new_periods = msg.get("periods", None)
+            # validate periods if provided
+            if new_periods is not None:
+                valid = [int(p) for p in new_periods if isinstance(p, (int, float)) or (isinstance(p, str) and str(p).isdigit())]
+                valid = [p for p in valid if p in ALLOWED_RSI_PERIODS]
+                if valid:
+                    rsi_periods = sorted(set(valid))
+            include_rsi = bool(new_include)
+            await websocket.send_json({
+                "type": "ack",
+                "message": "RSI settings updated",
+                "include_rsi": include_rsi,
+                "periods": rsi_periods
+            })
 
     try:
         while True:
             await asyncio.sleep(poll)
 
-            # fetch latest set (limit small to reduce payload; include last + prev)
+            # allow runtime control (toggle RSI / change periods) without reconnect
+            await maybe_receive_control()
+
+            # fetch fresh small window
             raw2 = await svc.fetch_binance_data(interval, max(2, min(limit, 200)))
             df2 = svc.process_data(raw2) if raw2 else None
             if df2 is None or df2.empty:
-                # transient error -> skip this tick
                 continue
 
             latest_arr = svc.create_rows_array(df2)
             latest_candle = latest_arr[-1]
             latest_time_ms = latest_candle["time"]
-
             is_new_bar = (last_bar_time_ms is not None and latest_time_ms > last_bar_time_ms)
 
-            # send update (always send, FE can decide how to merge)
+            if include_rsi:
+                # compute latest RSI on same df2 and attach to candle
+                rsi_latest = latest_rsi_values(df2, rsi_periods)
+                latest_candle["rsi"] = rsi_latest
+
             await websocket.send_json({
                 "type": "update",
                 "symbol": symbol,
@@ -385,15 +424,12 @@ async def ws_data(websocket: WebSocket):
                 "is_new_bar": bool(is_new_bar)
             })
 
-            # update tracker if new bar started
             if is_new_bar:
                 last_bar_time_ms = latest_time_ms
 
     except WebSocketDisconnect:
-        # client disconnected; just exit
         return
     except Exception as e:
-        # unexpected error; try to notify client and close
         try:
             await websocket.send_json({"type": "error", "detail": f"Server error: {str(e)}"})
         finally:
