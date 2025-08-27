@@ -221,6 +221,111 @@ def _safe_int(value: Optional[str], default: int) -> int:
     except Exception:
         return default
 
+
+
+@app.get("/api/search")
+async def search_symbols(
+    q: Optional[str] = Query(None, description="Search query for symbols (optional)"),
+):
+    """
+    Search only USDT pairs.
+    - If q is empty -> return ALL TRADING USDT pairs
+    - If q is a coin name (e.g. 'BTC') -> auto-append 'USDT'
+    """
+    global _EXINFO_CACHE, _EXINFO_TTL
+
+    now = time.time()
+    if not _EXINFO_CACHE["data"] or (now - _EXINFO_CACHE["ts"] > _EXINFO_TTL):
+        try:
+            url = "https://api3.binance.com/api/v3/exchangeInfo"
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                _EXINFO_CACHE["data"] = resp.json()
+                _EXINFO_CACHE["ts"] = now
+        except httpx.RequestError:
+            raise HTTPException(status_code=500, detail="Failed to fetch symbols from Binance")
+
+    data = _EXINFO_CACHE["data"]
+
+    # full TRADING list with only USDT quote
+    all_trading = []
+    for s in data.get("symbols", []):
+        if s.get("status") == "TRADING" and s.get("quoteAsset") == "USDT":
+            all_trading.append(s.get("symbol"))  # e.g. BTCUSDT
+
+    if not q or not q.strip():
+        return {"symbols": all_trading}
+
+    query = q.strip().upper()
+    if not query.endswith("USDT"):
+        query = query + "USDT"
+
+    if query in all_trading:
+        return {"symbols": [query]}
+
+    base = query.replace("USDT", "")
+    hits = [sym for sym in all_trading if base in sym]
+    if hits:
+        return {"symbols": hits[:10]}
+
+    return {"message": f"{query} not available against USDT"}
+
+@app.get("/api/popular")
+async def get_popular_symbols():
+    """
+    Return exactly top 10 USDT pairs from last 24h by quote volume.
+    Response JSON: [{"symbol": "BTC", "price": 67000.5}, ...]
+    """
+    url = "https://api3.binance.com/api/v3/ticker/24hr"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            tickers = r.json()
+    except httpx.RequestError:
+        raise HTTPException(status_code=500, detail="Failed to fetch 24h tickers")
+
+    rows = []
+    for t in tickers:
+        sym = t.get("symbol", "")
+        if not sym.endswith("USDT"):  # only USDT pairs
+            continue
+        try:
+            rows.append({
+                "symbol": sym.replace("USDT", ""),  # base only
+                "price": float(t.get("lastPrice", 0) or 0),
+                "quoteVolume": float(t.get("quoteVolume", 0) or 0),
+            })
+        except (TypeError, ValueError):
+            continue
+
+    rows.sort(key=lambda x: x["quoteVolume"], reverse=True)
+    top10 = [{"symbol": r["symbol"], "price": r["price"]} for r in rows[:10]]
+    return top10
+
+@app.get("/api/timeframes")
+async def get_timeframes():
+    """Return timeframes as a simple JSON list (interval + label)."""
+    return [
+        {"interval": "1m",  "label": "1 Minute"},
+        {"interval": "3m",  "label": "3 Minutes"},
+        {"interval": "5m",  "label": "5 Minutes"},
+        {"interval": "15m", "label": "15 Minutes"},
+        {"interval": "30m", "label": "30 Minutes"},
+        {"interval": "1h",  "label": "1 Hour"},
+        {"interval": "2h",  "label": "2 Hours"},
+        {"interval": "4h",  "label": "4 Hours"},
+        {"interval": "6h",  "label": "6 Hours"},
+        {"interval": "8h",  "label": "8 Hours"},
+        {"interval": "12h", "label": "12 Hours"},
+        {"interval": "1d",  "label": "1 Day"},
+        {"interval": "3d",  "label": "3 Days"},
+        {"interval": "1w",  "label": "1 Week"},
+        {"interval": "1M",  "label": "1 Month"},
+    ]
+
+
 @app.websocket("/ws/data")
 async def ws_data(websocket: WebSocket):
     """
