@@ -249,7 +249,7 @@ def _safe_int(value: Optional[str], default: int) -> int:
 @app.get("/get_price/{symbol}")
 def get_price(symbol: str):
     symbol = symbol.upper()
-    print(f"[*] User requested symbol: {symbol}")  # Debug
+    
 
     try:
         # Step 1: Get all Binance symbols
