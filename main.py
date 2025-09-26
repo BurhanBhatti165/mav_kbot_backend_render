@@ -10,6 +10,7 @@ import time
 import asyncio
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+import requests
 import httpx  # async HTTP client
 
 # indicators
@@ -244,6 +245,55 @@ def _safe_int(value: Optional[str], default: int) -> int:
         return int(value)
     except Exception:
         return default
+    
+@app.get("/get_price/{symbol}")
+def get_price(symbol: str):
+    symbol = symbol.upper()
+    print(f"[*] User requested symbol: {symbol}")  # Debug
+
+    try:
+        # Step 1: Get all Binance symbols
+        exchange_info_url = "https://api.binance.com/api/v3/exchangeInfo"
+        response = requests.get(exchange_info_url)
+        response.raise_for_status()
+
+        data = response.json()
+        if "symbols" not in data:
+            raise HTTPException(status_code=500, detail="Unexpected response from Binance exchangeInfo.")
+
+        symbols_list = [s["symbol"] for s in data["symbols"]]
+        
+
+        # Step 2: Check if symbol exists
+        if symbol not in symbols_list:
+            
+            raise HTTPException(status_code=404, detail=f"Symbol '{symbol}' does not exist on Binance.")
+
+        # Step 3: Get price
+        price_url = f"https://api.binance.com/api/v3/avgPrice?symbol={symbol}"
+        price_response = requests.get(price_url)
+        
+        price_response.raise_for_status()
+
+        price_data = price_response.json()
+        
+
+        if "price" not in price_data:
+            
+            raise HTTPException(status_code=500, detail="Unexpected response from Binance avgPrice.")
+
+        return {
+            "symbol": symbol,
+            "price": price_data["price"]
+        }
+
+    except requests.exceptions.RequestException as e:
+        
+        raise HTTPException(status_code=500, detail=f"Network error: {str(e)}")
+
+    except Exception as e:
+        
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 @app.get("/api/search")
 async def search_symbols(q: Optional[str] = Query(None, description="Search query for symbols (optional)")):
