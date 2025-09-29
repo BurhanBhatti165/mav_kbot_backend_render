@@ -48,9 +48,16 @@ POLL_SECONDS = {
 
 app = FastAPI(title="Crypto Chart API", description="Real-time cryptocurrency charting application")
 
+# Configure CORS for production
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://mav-kbot-frontend-render.vercel.app",
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:5173"
+    ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
@@ -603,11 +610,19 @@ async def ws_data(websocket: WebSocket):
 
 # -------------------- ENTRYPOINT --------------------
 
+import os
+
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    host = os.environ.get("HOST", "0.0.0.0")
+    
     uvicorn.run(
         "main:app",
-        host="127.0.0.1",
-        port=8000,
-        reload=True,
+        host=host,
+        port=port,
+        reload=False,  # Disable reload in production
         log_level="info"
     )
+
+# For Vercel deployment
+app_instance = app
