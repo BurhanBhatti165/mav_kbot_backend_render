@@ -1,10 +1,10 @@
 {
-  "builds": [
-    {
-      "src": "main.py",
-      "use": "@vercel/python"
+  "functions": {
+    "main.py": {
+      "runtime": "python3.11",
+      "maxDuration": 10
     }
-  ],
+  },
   "routes": [
     {
       "src": "/(.*)",
@@ -14,9 +14,23 @@
   "env": {
     "PYTHONPATH": "."
   },
-  "functions": {
-    "main.py": {
-      "runtime": "python3.11"
+  "headers": [
+    {
+      "source": "/api/(.*)",
+      "headers": [
+        {
+          "key": "Access-Control-Allow-Origin",
+          "value": "https://mav-kbot-frontend-render.vercel.app"
+        },
+        {
+          "key": "Access-Control-Allow-Methods",
+          "value": "GET, POST, OPTIONS"
+        },
+        {
+          "key": "Access-Control-Allow-Headers",
+          "value": "Content-Type, Authorization"
+        }
+      ]
     }
-  }
+  ]
 }
