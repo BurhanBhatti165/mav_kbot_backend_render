@@ -93,7 +93,7 @@ class CryptoDataService:
         self.symbol = symbol.upper()
 
     async def validate_symbol(self) -> tuple[bool, dict]:
-        url = "https://api3.binance.us/api/v3/ticker/24hr"
+        url = "https://api.binance.us/api/v3/ticker/24hr"
         params = {"symbol": self.symbol}
         try:
             async with httpx.AsyncClient(timeout=5) as client:
@@ -105,7 +105,7 @@ class CryptoDataService:
             return False, {}
 
     async def fetch_binance_data(self, interval: str = "15m", limit: int = 100) -> Optional[List]:
-        url = "https://api3.binance.us/api/v3/uiKlines"
+        url = "https://api.binance.us/api/v3/klines"
         params = {"symbol": self.symbol, "interval": interval, "limit": limit}
         try:
             async with httpx.AsyncClient(timeout=10) as client:
@@ -308,7 +308,7 @@ async def search_symbols(q: Optional[str] = Query(None, description="Search quer
     now = time.time()
     if not _EXINFO_CACHE["data"] or (now - _EXINFO_CACHE["ts"] > _EXINFO_TTL):
         try:
-            url = "https://api3.binance.us/api/v3/exchangeInfo"
+            url = "https://api.binance.us/api/v3/exchangeInfo"
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(url)
                 resp.raise_for_status()
@@ -341,7 +341,7 @@ async def search_symbols(q: Optional[str] = Query(None, description="Search quer
 
 @app.get("/api/popular")
 async def get_popular_symbols():
-    url = "https://api3.binance.us/api/v3/ticker/24hr"
+    url = "https://api.binance.us/api/v3/ticker/24hr"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(url)
