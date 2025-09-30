@@ -1,14 +1,8 @@
 {
-  "functions": {
-    "main.py": {
-      "runtime": "@vercel/python@3.1.0",
-      "maxDuration": 10
-    }
-  },
   "rewrites": [
     {
       "source": "/(.*)",
-      "destination": "main.py"
+      "destination": "/api/index"
     }
   ],
   "env": {
