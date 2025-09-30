@@ -93,7 +93,7 @@ class CryptoDataService:
         self.symbol = symbol.upper()
 
     async def validate_symbol(self) -> tuple[bool, dict]:
-        url = "https://api3.binance.com/api/v3/ticker/24hr"
+        url = "https://api3.binance.us/api/v3/ticker/24hr"
         params = {"symbol": self.symbol}
         try:
             async with httpx.AsyncClient(timeout=5) as client:
@@ -105,7 +105,7 @@ class CryptoDataService:
             return False, {}
 
     async def fetch_binance_data(self, interval: str = "15m", limit: int = 100) -> Optional[List]:
-        url = "https://api3.binance.com/api/v3/uiKlines"
+        url = "https://api3.binance.us/api/v3/uiKlines"
         params = {"symbol": self.symbol, "interval": interval, "limit": limit}
         try:
             async with httpx.AsyncClient(timeout=10) as client:
@@ -260,7 +260,7 @@ def get_price(symbol: str):
 
     try:
         # Step 1: Get all Binance symbols
-        exchange_info_url = "https://api.binance.com/api/v3/exchangeInfo"
+        exchange_info_url = "https://api.binance.us/api/v3/exchangeInfo"
         response = requests.get(exchange_info_url)
         response.raise_for_status()
 
@@ -277,7 +277,7 @@ def get_price(symbol: str):
             raise HTTPException(status_code=404, detail=f"Symbol '{symbol}' does not exist on Binance.")
 
         # Step 3: Get price
-        price_url = f"https://api.binance.com/api/v3/avgPrice?symbol={symbol}"
+        price_url = f"https://api.binance.us/api/v3/avgPrice?symbol={symbol}"
         price_response = requests.get(price_url)
         
         price_response.raise_for_status()
@@ -308,7 +308,7 @@ async def search_symbols(q: Optional[str] = Query(None, description="Search quer
     now = time.time()
     if not _EXINFO_CACHE["data"] or (now - _EXINFO_CACHE["ts"] > _EXINFO_TTL):
         try:
-            url = "https://api3.binance.com/api/v3/exchangeInfo"
+            url = "https://api3.binance.us/api/v3/exchangeInfo"
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(url)
                 resp.raise_for_status()
@@ -341,7 +341,7 @@ async def search_symbols(q: Optional[str] = Query(None, description="Search quer
 
 @app.get("/api/popular")
 async def get_popular_symbols():
-    url = "https://api3.binance.com/api/v3/ticker/24hr"
+    url = "https://api3.binance.us/api/v3/ticker/24hr"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(url)
