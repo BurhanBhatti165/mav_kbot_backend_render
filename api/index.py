@@ -89,7 +89,7 @@ class CandleOut(BaseModel):
 # -------------------- Service --------------------
 
 class CryptoDataService:
-    def _init_(self, symbol: str = "BTCUSDT"):
+    def __init__(self, symbol: str = "BTCUSDT"):
         self.symbol = symbol.upper()
 
     async def validate_symbol(self) -> tuple[bool, dict]:
